@@ -1,0 +1,58 @@
+if(NOT DEFINED DETECT_EXE OR NOT DEFINED TEST_DIR)
+    message(FATAL_ERROR "Missing test paths")
+endif()
+file(MAKE_DIRECTORY "${TEST_DIR}")
+
+set(policy "[global]\nwindow_ms=100\n[id:0x100]\nid_type=standard\nallowed_dlc=4\nperiodic=1\nperiod_min_us=8000\nperiod_max_us=12000\nrate_limit_100ms=3\nfixed_mask=0000000000000000\nfixed_value=0000000000000000\nignore_mask=0000000000000000\nmax_identical_payload_run=4\n")
+set(rules "${TEST_DIR}/timing.ini")
+file(WRITE "${rules}" "${policy}")
+string(REPLACE "periodic=1\nperiod_min_us=8000\nperiod_max_us=12000"
+    "periodic=0\nperiod_min_us=0\nperiod_max_us=0" nonperiodic "${policy}")
+file(WRITE "${TEST_DIR}/nonperiodic.ini" "${nonperiodic}")
+
+function(check_log name rules log expected_count expected_rule)
+    set(path "${TEST_DIR}/${name}.log")
+    file(WRITE "${path}" "${log}")
+    execute_process(COMMAND "${DETECT_EXE}" --rules "${rules}" --check-log "${path}"
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(NOT result EQUAL 0 OR NOT error STREQUAL "" OR
+       NOT output MATCHES "only; ${expected_count} alerts.")
+        message(FATAL_ERROR "${name}: exit=${result}, stdout=${output}, stderr=${error}")
+    endif()
+    if(NOT expected_rule STREQUAL "" AND NOT output MATCHES "${expected_rule}")
+        message(FATAL_ERROR "${name}: expected ${expected_rule}, got ${output}")
+    endif()
+    set(last_output "${output}" PARENT_SCOPE)
+    message(STATUS "PASS ${name}")
+endfunction()
+
+set(first "(0.000000) vcan0 100#01020304\n")
+check_log(first_no_period "${rules}" "${first}" 0 "")
+check_log(inclusive_bounds "${rules}" "${first}(0.008000) vcan0 100#01020304\n(0.020000) vcan0 100#01020304\n" 0 "")
+check_log(too_fast "${rules}" "${first}(0.002000) vcan0 100#01020304\n" 1 "PERIOD_VIOLATION MEDIUM")
+check_log(too_slow "${rules}" "${first}(0.012001) vcan0 100#01020304\n" 1 "PERIOD_VIOLATION MEDIUM")
+check_log(fourth_in_window "${rules}" "${first}(0.010000) vcan0 100#01020304\n(0.020000) vcan0 100#01020304\n(0.030000) vcan0 100#01020304\n" 1 "RATE_SPIKE HIGH")
+if(last_output MATCHES "PERIOD_VIOLATION MEDIUM")
+    message(FATAL_ERROR "Valid periods incorrectly flagged during rate spike")
+endif()
+set(rate_rules "${TEST_DIR}/nonperiodic.ini")
+check_log(expiry_100ms "${rate_rules}" "${first}(0.010000) vcan0 100#01020304\n(0.020000) vcan0 100#01020304\n(0.100000) vcan0 100#01020304\n" 0 "")
+check_log(before_expiry "${rate_rules}" "${first}(0.010000) vcan0 100#01020304\n(0.020000) vcan0 100#01020304\n(0.099999) vcan0 100#01020304\n" 1 "RATE_SPIKE HIGH")
+check_log(nonperiodic_no_period "${rate_rules}" "${first}(0.000001) vcan0 100#01020304\n" 0 "")
+check_log(separate_interfaces "${rules}" "(0.020000) vcan0 100#01020304\n(0.010000) vcan1 100#01020304\n(0.030000) vcan0 100#01020304\n(0.020000) vcan1 100#01020304\n" 0 "")
+
+set(backward "${TEST_DIR}/backward.log")
+# The first two frames would generate a period alert, which must not be
+# published when the third frame makes the input sequence invalid.
+file(WRITE "${backward}" "(0.010000) vcan0 100#01020304\n(0.011000) vcan0 100#01020304\n(0.009000) vcan0 100#01020304\n")
+file(SHA256 "${backward}" hash_before)
+execute_process(COMMAND "${DETECT_EXE}" --rules "${rules}" --check-log "${backward}"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 1 OR NOT output STREQUAL "" OR NOT error MATCHES "timestamp")
+    message(FATAL_ERROR "Backward input not rejected cleanly: ${result} ${output} ${error}")
+endif()
+file(SHA256 "${backward}" hash_after)
+if(NOT hash_before STREQUAL hash_after)
+    message(FATAL_ERROR "Timestamp validation modified input")
+endif()
+message(STATUS "PASS backward_timestamp_no_partial_output")
